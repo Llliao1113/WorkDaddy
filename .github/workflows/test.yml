@@ -1,0 +1,20 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Update deadlock recovery tests (issue #51)
+        run: node --test test/update-deadlock-recovery.test.js
+      - name: Existing boundary contract tests
+        run: |
+          node --test test/windows-powershell-boundary.test.js
+          node --test test/windows-privilege-boundary.test.js
