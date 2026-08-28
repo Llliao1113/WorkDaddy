@@ -259,6 +259,30 @@ fs.writeFileSync(PID_FILE, String(process.pid), { flag: 'wx' });
 let child = null;
 let stopping = false;
 let restartDelay = 3000; // 初始 3s，连续崩溃递增，上限 60s
+let pendingRecheckTimer = null; // 更新等待期复查定时器（防死锁：见 schedulePendingRecheck）
+
+function schedulePendingRecheck() {
+  // 【防死锁加固】原实现：daemon 在更新窗口内退出 → watchdog 检查一次 pending.json →
+  // 标记存在（或宽限期内）→ 直接 return，从此再无人复查。updatePendingIsActive() 内置的
+  // 10 分钟宽限清理逻辑因此成为死代码——apply-update.ps1 若在任何未清理标记的路径上崩溃
+  // （issue #51：早期校验 throw 在 finally 之前），watchdog 将永久拒绝拉起 daemon。
+  // 现在：跳过重启时启动本定时器，持续复查标记；标记被 apply 脚本删除、或宽限期满被
+  // updatePendingIsActive() 清理后，自动重新拉起 daemon，形成自愈闭环。
+  if (pendingRecheckTimer) return;
+  pendingRecheckTimer = setInterval(() => {
+    if (stopping) {
+      clearInterval(pendingRecheckTimer);
+      pendingRecheckTimer = null;
+      return;
+    }
+    if (updatePendingIsActive()) return; // 更新仍在进行（脚本活着或宽限期内）
+    clearInterval(pendingRecheckTimer);
+    pendingRecheckTimer = null;
+    if (child) return; // daemon 已在运行（外部拉起），无需干预
+    log('更新标记已清除，重新拉起 daemon');
+    startDaemon();
+  }, 15000);
+}
 
 function startDaemon() {
   if (stopping) return;
@@ -277,6 +301,7 @@ function startDaemon() {
     // 标记由 apply-update.ps1 成功/失败后删除；删除后靠新版 launcher/手动启动重新拉起。
     if (updatePendingIsActive()) {
       log('检测到更新标记 pending.json，跳过自动重启 daemon（等待 apply-update.ps1 完成替换）');
+      schedulePendingRecheck(); // 持续复查：脚本崩溃/标记过期后自动恢复，杜绝永久死锁
       return;
     }
     log('daemon 退出 code=' + code + ' signal=' + signal + '，' + restartDelay + 'ms 后重启');
@@ -293,6 +318,10 @@ startDaemon();
 function shutdown() {
   if (stopping) return;
   stopping = true;
+  if (pendingRecheckTimer) {
+    clearInterval(pendingRecheckTimer);
+    pendingRecheckTimer = null;
+  }
   log('watchdog 收到停止信号，结束 daemon');
   if (child) {
     try { child.kill(); } catch (_) {}

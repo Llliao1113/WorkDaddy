@@ -1,5 +1,9 @@
 ﻿# WorkDaddy Windows 自动更新替换脚本。
 # 独立于 daemon 运行：停止 watchdog、替换安装目录、启动新版并验证 API；失败时保留日志并回滚。
+# 【防死锁契约】daemon 在 spawn 本脚本前已写入 update/pending.json 且自我退出，watchdog 检测到
+# 该标记后不会重启 daemon（防端口抢占竞态）。因此本脚本无论成功、失败还是早期校验不过，
+# 退出前都必须：① 写 apply.log 留证 ② 删除 pending.json。任何绕过这两步的退出路径都会把
+# 应用留在「daemon 已死、watchdog 永不拉起」的永久卡死状态（issue #51 的死锁根因）。
 [CmdletBinding()]
 param(
   [Parameter(Mandatory = $true)][Alias('SrcZip')][string]$SrcPackage,
@@ -10,28 +14,25 @@ param(
   [string]$Profile = '__WBS_DEFAULT_PROFILE__'
 )
 
+# 【防死锁加固】boundary 加载与路径一致性校验原先位于日志初始化与主 try/finally 之前，
+# 失败会静默退出：apply.log 不存在、pending.json 残留，无从排查且造成 watchdog 永久拒启
+# （issue #51）。现移入主 try：失败会写入 apply.log 并由 finally 无条件清理 pending.json。
+# 权限探针保留在目录创建与日志初始化之前（windows-powershell-boundary 契约要求），
+# 但失败时不再 exit 5，改为记录错误延后到主 try 内 throw，确保 transcript 已启动 → 有日志。
+$ErrorActionPreference = 'Stop'
+$privilegeError = $null
 try {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = New-Object Security.Principal.WindowsPrincipal($identity)
   $isElevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
   $env:WBSWITCH_PRIVILEGE_MODE = if ($isElevated) { 'elevated' } else { 'standard' }
 } catch {
-  [Console]::Error.WriteLine('无法确认当前 PowerShell 的 Windows 权限模式；更新已停止。')
-  exit 5
-}
-
-$ErrorActionPreference = 'Stop'
-try { . (Join-Path $PSScriptRoot 'windows-process-boundary.ps1') } catch {
-  [Console]::Error.WriteLine('无法加载 Windows 进程身份边界；更新已停止。')
-  exit 5
+  $privilegeError = "无法确认 PowerShell 权限模式: $($_.Exception.Message)"
 }
 if ([string]::IsNullOrWhiteSpace($Profile) -or $Profile -eq '__WBS_DEFAULT_PROFILE__') { $Profile = 'workbuddy-cn' }
 if ($Profile -ne 'workbuddy-ai') { $Profile = 'workbuddy-cn' }
 $productName = if ($Profile -eq 'workbuddy-ai') { 'WorkDaddy AI' } else { 'WorkDaddy' }
 if ([string]::IsNullOrWhiteSpace($AppDir)) { $AppDir = Join-Path $env:LOCALAPPDATA (Join-Path 'Programs' $productName) }
-if (-not (Test-SameWindowsPath -Left $PSScriptRoot -Right (Join-Path $AppDir 'scripts'))) {
-  throw '更新脚本位置与目标安装目录不一致，拒绝替换'
-}
 $dataRoot = Join-Path $env:APPDATA 'WorkDaddy'
 $DataDir = if ($Profile -eq 'workbuddy-ai') { Join-Path $dataRoot 'profiles\workbuddy-ai' } else { $dataRoot }
 $LogDir = Join-Path $DataDir 'update'
@@ -98,15 +99,30 @@ function Rollback-App {
 $oldDir = "$AppDir.old"
 $tmpDir = Join-Path $env:TEMP ("workdaddy-update-" + [guid]::NewGuid().ToString('N'))
 $backupMade = $false
-$lifecycleValidated = $false
 $isSetupPackage = $false
 try {
   Write-ApplyLog "start attempt=$AttemptId src=$SrcPackage dst=$AppDir port=$Port pid=$PID"
+
+  # 【校验 1】权限模式已在脚本顶部探测（契约：探针须在 New-Item/Start-Transcript 前）。
+  # 顶部失败时只记录错误，延后到此 throw：transcript 已启动 → 有日志，finally → 清 pending。
+  if ($privilegeError) { throw $privilegeError }
+
+  # 【校验 2】加载 Windows 进程身份边界（提供 Test-SameWindowsPath / 停进程等函数）。
+  try { . (Join-Path $PSScriptRoot 'windows-process-boundary.ps1') } catch {
+    throw "无法加载 Windows 进程身份边界: $($_.Exception.Message)"
+  }
+
+  # 【校验 3】路径一致性防误替换（安全网，保留原语义；典型触发：非标准目录安装 +
+  # daemon 传入了与脚本实际位置不一致的目标目录）。失败现在会留日志并清标记，
+  # 而不是静默崩溃把应用留在死锁态。
+  if (-not (Test-SameWindowsPath -Left $PSScriptRoot -Right (Join-Path $AppDir 'scripts'))) {
+    throw "更新脚本位置与目标安装目录不一致，拒绝替换（实际脚本: $PSScriptRoot，目标: $AppDir）"
+  }
+
   if (-not (Test-Path -LiteralPath $SrcPackage -PathType Leaf)) { throw "更新包不存在: $SrcPackage" }
   $isSetupPackage = ([IO.Path]::GetExtension($SrcPackage) -ieq '.exe')
   Stop-WatchdogAndPort
   Stop-WorkBuddyForUpdate
-  $lifecycleValidated = $true
 
   foreach ($launcherPath in @((Join-Path $AppDir 'scripts\launcher.cmd'), (Join-Path $oldDir 'scripts\launcher.cmd'))) {
     if (-not (Release-VerifiedLauncherLock -LauncherPath $launcherPath)) { throw "无法释放 launcher.cmd 文件锁: $launcherPath" }
@@ -204,8 +220,10 @@ try {
   Stop-ApplyTranscript
   exit 1
 } finally {
-  if ($lifecycleValidated) {
-    try { if (Test-Path -LiteralPath $tmpDir) { Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue } } catch {}
-    try { Remove-Item -LiteralPath (Join-Path $LogDir 'pending.json') -Force -ErrorAction SilentlyContinue } catch {}
-  }
+  # 【防死锁契约 · 兜底】本脚本是唯一的更新执行者：无论走到哪一步退出（含早期校验失败），
+  # 更新流程都已结束，pending.json 必须删除，否则 watchdog 将永久拒绝重启 daemon。
+  # 原实现以 $lifecycleValidated 门控本清理，导致「停止 watchdog 之前」的任何失败
+  # （路径不一致、包缺失等）都会残留标记 → issue #51 永久卡死。现改为无条件清理。
+  try { if (Test-Path -LiteralPath $tmpDir) { Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue } } catch {}
+  try { Remove-Item -LiteralPath (Join-Path $LogDir 'pending.json') -Force -ErrorAction SilentlyContinue } catch {}
 }
